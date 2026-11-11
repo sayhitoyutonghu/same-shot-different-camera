@@ -48,6 +48,12 @@
   .looking .tag { opacity:0; }
   @keyframes blink { 50% { opacity:.15; } }
   @media (prefers-reduced-motion: reduce) { .desk, .look, .site { transition:none; } }
+.screen canvas {position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.screen {touch-action:none}
+.capture {display:flex;gap:.6rem;justify-content:center;align-items:center}
+.capture button {background:#fff;color:#111;border:0;border-radius:99px;padding:.55em 1em}
+.look {overflow:auto}
+@media(max-width:700px){.look{padding:8vh 3vw 2vh;gap:1vh}.screen.tall{width:min(72%,calc(45vh * 9 / 16))}.note{display:none}.prompt{min-height:0}}
 </style>
 </head>
 <body>
@@ -56,7 +62,7 @@
   <div class="plate" id="plate">Same shot. Pick a camera.</div>
   <div class="look">
     <div class="screen" id="screen"><img id="shot" alt=""><div class="hud"><i></i><i></i><i></i><i></i><span class="af"></span><span class="rec">REC</span><span class="info"><span id="hudL"></span><span id="hudR"></span></span></div></div>
-    <div class="name" id="name"></div>
+    <div class="capture"><button id="tilt" hidden>Enable tilt</button><button id="shutter">Take photo</button></div><div class="name" id="name"></div>
     <div class="prompt" id="prompt"></div>
     <div class="note" id="note"></div>
     <div class="top"><button type="button" id="back">Back to the desk</button><button type="button" class="go" id="go">Open Flow</button></div>
@@ -93,11 +99,12 @@ function apply(slow) {
   desk.style.transform = t;
 }
 function stop() { clearInterval(timer); timer = null; clearInterval(typer); }
-function open(i) {
+function open(i) { frozen=false; angleX=angleY=0; origin=null; captureLabel();
+
   const k = cams[i]; cur = i; stop(); app.scrollTo(0,0);
   screen.classList.toggle('tall', !!k.tall);
   shot.alt = 'The beach scene as the ' + k.n + ' would shoot it';
-  if (k.video) { let f = 0; shot.src = CAM.frames[0]; timer = setInterval(() => { f = (f + 1) % CAM.frames.length; shot.src = CAM.frames[f]; }, 400); } else shot.src = k.img;
+  if (k.video) { let f = 0; shot.src = CAM.frames[0]; timer = setInterval(() => { if (frozen) return; f = (f + 1) % CAM.frames.length; shot.src = CAM.frames[f]; }, 400); } else shot.src = k.img;
   $('name').textContent = k.n; $('hudL').textContent = k.l; $('hudR').textContent = k.rr;
   $('note').textContent = k.video ? 'Video generated in Flow with Omni 1.2 Flash, shown as 12 frames.' : 'Still generated in Flow with Nano Banana 2.1.';
   let n = 0; const draw = () => { $('prompt').innerHTML = base + ' <mark>' + k.add.slice(0, n) + '</mark>'; };
@@ -114,6 +121,76 @@ $('back').addEventListener('click', close);
 $('go').addEventListener('click', () => { stop(); app.classList.add('open'); });
 $('again').addEventListener('click', () => { app.classList.remove('open'); close(); });
 addEventListener('keydown', e => { if (e.key === 'Escape') { if (app.classList.contains('open')) $('again').click(); else if (cur >= 0) close(); } });
+
+const canvas=document.createElement('canvas');
+screen.insertBefore(canvas,screen.querySelector('.hud'));
+const gl=canvas.getContext('webgl',{alpha:true,antialias:false});
+let frozen=false,angleX=0,angleY=0,origin=null,renderDepth=null;
+function captureLabel(){
+  $('shutter').textContent=frozen?'Retake':'Take photo';
+  screen.querySelector('.rec').textContent=frozen?'HOLD':'LIVE';
+}
+if(gl){
+  const program=gl.createProgram();
+  for(const [type,source] of [
+    [gl.VERTEX_SHADER,'attribute vec2 pos; varying vec2 uv; void main(){uv=vec2(pos.x,-pos.y)*.5+.5; gl_Position=vec4(pos,0.,1.);}'],
+    [gl.FRAGMENT_SHADER,`precision mediump float;
+      varying vec2 uv; uniform sampler2D photo; uniform vec2 angle; uniform vec2 crop;
+      void main(){
+        vec2 d=(uv-vec2(.5,.55))/vec2(.19,.28);
+        float subject=.47*exp(-dot(d,d)*1.5);
+        float depth=clamp(.65*smoothstep(.42,1.,uv.y)+subject,0.,1.);
+        vec2 coords=(uv-.5)*crop*.95+.5+angle*depth*crop*.023;
+        gl_FragColor=texture2D(photo,coords);
+      }`]
+  ]){const shader=gl.createShader(type);gl.shaderSource(shader,source);gl.compileShader(shader);gl.attachShader(program,shader);}
+  gl.linkProgram(program);
+  if(gl.getProgramParameter(program,gl.LINK_STATUS)){
+    gl.useProgram(program);
+    const buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);
+    gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+    const pos=gl.getAttribLocation(program,'pos');gl.enableVertexAttribArray(pos);gl.vertexAttribPointer(pos,2,gl.FLOAT,false,0,0);
+    const tex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tex);
+    for(const key of [gl.TEXTURE_WRAP_S,gl.TEXTURE_WRAP_T])gl.texParameteri(gl.TEXTURE_2D,key,gl.CLAMP_TO_EDGE);
+    for(const key of [gl.TEXTURE_MIN_FILTER,gl.TEXTURE_MAG_FILTER])gl.texParameteri(gl.TEXTURE_2D,key,gl.LINEAR);
+    const ang=gl.getUniformLocation(program,'angle'),crop=gl.getUniformLocation(program,'crop');
+    renderDepth=(upload=false)=>{
+      if(!shot.complete||!shot.naturalWidth||cur<0)return;
+      const w=screen.clientWidth,h=screen.clientHeight;
+      const scale=Math.min(devicePixelRatio,2);
+      if(canvas.width!==Math.round(w*scale)||canvas.height!==Math.round(h*scale)){canvas.width=Math.round(w*scale);canvas.height=Math.round(h*scale);}
+      if(upload)gl.texImage2D(gl.TEXTURE_2D,0,gl.RGB,gl.RGB,gl.UNSIGNED_BYTE,shot);
+      gl.viewport(0,0,canvas.width,canvas.height);
+      const ratio=(w/h)/(shot.naturalWidth/shot.naturalHeight);
+      gl.uniform2f(crop,Math.min(1,ratio),Math.min(1,1/ratio));
+      gl.uniform2f(ang,angleX,angleY);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+    };
+    shot.addEventListener('load',()=>renderDepth(true));addEventListener('resize',()=>renderDepth());
+  }
+}
+function setAngle(x,y){
+  if(cur<0||frozen||app.classList.contains('open'))return;
+  angleX=Math.max(-1,Math.min(1,x));angleY=Math.max(-1,Math.min(1,y));
+  if(renderDepth)renderDepth();
+}
+screen.addEventListener('pointermove',e=>{
+  const r=screen.getBoundingClientRect();setAngle(2*(e.clientX-r.left)/r.width-1,2*(e.clientY-r.top)/r.height-1);
+});
+function orient(e){
+  if(cur<0||frozen||e.gamma==null||e.beta==null)return;
+  if(!origin)origin=[e.gamma,e.beta];
+  const x=(e.gamma-origin[0])/16,y=(e.beta-origin[1])/16;
+  const a=(window.screen.orientation?.angle??window.orientation??0)*Math.PI/180;
+  setAngle(x*Math.cos(a)+y*Math.sin(a),y*Math.cos(a)-x*Math.sin(a));
+}
+if(renderDepth&&window.DeviceOrientationEvent){
+  if(typeof DeviceOrientationEvent.requestPermission==='function'){
+    $('tilt').hidden=false;
+    $('tilt').onclick=async()=>{try{if(await DeviceOrientationEvent.requestPermission()==='granted'){addEventListener('deviceorientation',orient);$('tilt').hidden=true;}else $('tilt').textContent='Drag to look';}catch{$('tilt').textContent='Drag to look';}};
+  }else addEventListener('deviceorientation',orient);
+}
+$('shutter').onclick=()=>{frozen=!frozen;captureLabel();};
+
 apply(false);
 </script>
 </body>
